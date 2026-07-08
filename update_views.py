@@ -1,20 +1,11 @@
 """
-Swarm — automatski update pregleda za campaign tracker (Google Sheets).
+Swarm — automatski update pregleda za campaign tracker (Google Sheets). v2
 
-Sta radi:
-  1. Otvori Google Sheet (tab "Videos")
-  2. Procita sve linkove ka videima
-  3. Povuce views/likes/comments:
-       - YouTube  -> zvanicni YouTube Data API v3 (besplatno)
-       - TikTok   -> Apify actor "clockworks/tiktok-scraper"
-       - Instagram-> Apify actor "apify/instagram-scraper"
-  4. Upise brojeve nazad u sheet + timestamp
+Novo u v2: povlaci i PRAVI datum objave videa i upisuje ga u kolonu Posted.
+(YouTube: snippet.publishedAt, TikTok: createTimeISO, Instagram: timestamp)
 
-Env varijable (u GitHub Actions ih dodajes kao Secrets):
-  SHEET_ID         - ID sheeta, deo URL-a izmedju /d/ i /edit
-  GOOGLE_SA_JSON   - ceo sadrzaj service-account .json fajla (kao string)
-  YOUTUBE_API_KEY  - API key sa console.cloud.google.com
-  APIFY_TOKEN      - token sa console.apify.com -> Settings -> API tokens
+Env varijable (GitHub Secrets):
+  SHEET_ID, GOOGLE_SA_JSON, YOUTUBE_API_KEY, APIFY_TOKEN
 """
 
 import json
@@ -28,16 +19,18 @@ import requests
 from google.oauth2.service_account import Credentials
 
 # ---------------------------------------------------------------------------
-# PODESAVANJE KOLONA — prilagodi ako ti tab "Videos" izgleda drugacije.
-# Slova kolona u Google Sheetu (A=1, B=2, ...).
+# PODESAVANJE KOLONA — uskladjeno sa tvojim sheetom:
+# A=Status, B=Creator, C=Platform, D=Video Link, E=Posted,
+# F=Views, G=Likes, H=Comments, I=Engagement %, J=Earned, K=Last Updated
 # ---------------------------------------------------------------------------
 TAB_NAME = "Videos"
-COL_LINK = "D"        # kolona sa linkom ka videu
-COL_VIEWS = "F"       # views
-COL_LIKES = "G"       # likes
-COL_COMMENTS = "H"    # comments
-COL_UPDATED = "K"     # "last updated" timestamp
-FIRST_DATA_ROW = 2    # red 1 je header
+COL_LINK = "D"
+COL_POSTED = "E"
+COL_VIEWS = "F"
+COL_LIKES = "G"
+COL_COMMENTS = "H"
+COL_UPDATED = "K"
+FIRST_DATA_ROW = 2
 
 YT_API = "https://www.googleapis.com/youtube/v3/videos"
 APIFY_RUN = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
@@ -45,9 +38,6 @@ TIKTOK_ACTOR = "clockworks~tiktok-scraper"
 IG_ACTOR = "apify~instagram-scraper"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def detect_platform(url: str) -> str | None:
     u = url.lower()
     if "youtube.com" in u or "youtu.be" in u:
@@ -73,6 +63,14 @@ def yt_video_id(url: str) -> str | None:
     return None
 
 
+def iso_to_date(value: str) -> str:
+    """'2026-07-01T12:34:56.000Z' -> '2026-07-01' (prazno ako ne moze)."""
+    if not value:
+        return ""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", str(value))
+    return m.group(1) if m else ""
+
+
 def col_to_index(col: str) -> int:
     idx = 0
     for ch in col.upper():
@@ -81,11 +79,10 @@ def col_to_index(col: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Fetcheri
+# Fetcheri — svaki vraca {url: {views, likes, comments, posted}}
 # ---------------------------------------------------------------------------
 def fetch_youtube(urls: list[str], api_key: str) -> dict[str, dict]:
-    """Vraca {url: {views, likes, comments}}. Batchuje po 50 ID-jeva."""
-    id_map = {}  # video_id -> url
+    id_map = {}
     for u in urls:
         vid = yt_video_id(u)
         if vid:
@@ -98,7 +95,7 @@ def fetch_youtube(urls: list[str], api_key: str) -> dict[str, dict]:
         r = requests.get(
             YT_API,
             params={
-                "part": "statistics",
+                "part": "snippet,statistics",
                 "id": ",".join(batch),
                 "key": api_key,
             },
@@ -107,10 +104,12 @@ def fetch_youtube(urls: list[str], api_key: str) -> dict[str, dict]:
         r.raise_for_status()
         for item in r.json().get("items", []):
             stats = item.get("statistics", {})
+            snippet = item.get("snippet", {})
             out[id_map[item["id"]]] = {
                 "views": int(stats.get("viewCount", 0)),
                 "likes": int(stats.get("likeCount", 0)),
                 "comments": int(stats.get("commentCount", 0)),
+                "posted": iso_to_date(snippet.get("publishedAt", "")),
             }
     return out
 
@@ -128,15 +127,23 @@ def fetch_tiktok(urls: list[str], token: str) -> dict[str, dict]:
     out = {}
     for item in r.json():
         url = item.get("webVideoUrl") or item.get("postPage") or ""
-        # normalizuj: uparuj po video ID-ju iz URL-a
         m = re.search(r"/video/(\d+)", url)
         vid = m.group(1) if m else None
+        posted = iso_to_date(item.get("createTimeISO", ""))
+        if not posted and item.get("createTime"):
+            try:
+                posted = datetime.fromtimestamp(
+                    int(item["createTime"]), tz=timezone.utc
+                ).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                posted = ""
         for original in urls:
             if vid and vid in original:
                 out[original] = {
                     "views": int(item.get("playCount", 0)),
                     "likes": int(item.get("diggCount", 0)),
                     "comments": int(item.get("commentCount", 0)),
+                    "posted": posted,
                 }
     return out
 
@@ -154,7 +161,6 @@ def fetch_instagram(urls: list[str], token: str) -> dict[str, dict]:
     out = {}
     for item in r.json():
         url = item.get("url", "")
-        # uparuj po shortcode-u (/reel/XXXX/ ili /p/XXXX/)
         m = re.search(r"/(?:reel|p)/([A-Za-z0-9_-]+)", url)
         code = m.group(1) if m else None
         for original in urls:
@@ -164,6 +170,7 @@ def fetch_instagram(urls: list[str], token: str) -> dict[str, dict]:
                     "views": int(views),
                     "likes": int(item.get("likesCount", 0)),
                     "comments": int(item.get("commentsCount", 0)),
+                    "posted": iso_to_date(item.get("timestamp", "")),
                 }
     return out
 
@@ -177,7 +184,6 @@ def main() -> int:
     yt_key = os.environ.get("YOUTUBE_API_KEY", "")
     apify_token = os.environ.get("APIFY_TOKEN", "")
 
-    # GOOGLE_SA_JSON moze biti JSON string ili putanja do fajla
     if sa_raw.strip().startswith("{"):
         sa_info = json.loads(sa_raw)
     else:
@@ -191,10 +197,8 @@ def main() -> int:
     gc = gspread.authorize(creds)
     ws = gc.open_by_key(sheet_id).worksheet(TAB_NAME)
 
-    link_col_idx = col_to_index(COL_LINK)
-    links = ws.col_values(link_col_idx)  # ukljucuje header
+    links = ws.col_values(col_to_index(COL_LINK))
 
-    # {url: row_number}
     rows = {}
     for i, val in enumerate(links, start=1):
         if i < FIRST_DATA_ROW:
@@ -245,7 +249,6 @@ def main() -> int:
         else:
             errors.append("Instagram linkovi postoje ali APIFY_TOKEN nije podesen")
 
-    # Batch upis nazad u sheet
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     updates = []
     for url, row in rows.items():
@@ -256,6 +259,8 @@ def main() -> int:
         updates.append({"range": f"{COL_LIKES}{row}", "values": [[d["likes"]]]})
         updates.append({"range": f"{COL_COMMENTS}{row}", "values": [[d["comments"]]]})
         updates.append({"range": f"{COL_UPDATED}{row}", "values": [[now]]})
+        if d.get("posted"):
+            updates.append({"range": f"{COL_POSTED}{row}", "values": [[d["posted"]]]})
 
     if updates:
         ws.batch_update(updates, value_input_option="USER_ENTERED")
@@ -264,7 +269,6 @@ def main() -> int:
     for e in errors:
         print(f"[greska] {e}")
 
-    # Ne rusimo Action ako je samo deo failovao — brojevi koji su prosli su upisani
     return 0
 
 
