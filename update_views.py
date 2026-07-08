@@ -32,7 +32,7 @@ from google.oauth2.service_account import Credentials
 # Slova kolona u Google Sheetu (A=1, B=2, ...).
 # ---------------------------------------------------------------------------
 TAB_NAME = "Videos"
-COL_LINK = "E"        # kolona sa linkom ka videu
+COL_LINK = "D"        # kolona sa linkom ka videu
 COL_VIEWS = "F"       # views
 COL_LIKES = "G"       # likes
 COL_COMMENTS = "H"    # comments
